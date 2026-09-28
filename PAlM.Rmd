@@ -1,0 +1,609 @@
+---
+title: "Project"
+author: "AmirrezaRezaee"
+date: "2026-07-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Packages & Library
+
+```{r}
+# install.packages("partykit")
+# install.packages("palmtree")
+# install.packages("TH.data")
+# install.packages("survival")
+# install.packages("Formula")
+# install.packages("sandwich")
+
+library(partykit)
+library(palmtree)
+library(TH.data)
+library(survival)
+library(Formula)
+library(sandwich)
+
+```
+
+# 0. Loding Data
+
+```{r}
+data("GBSG2", package = "TH.data") 
+GBSG2$y_surv <- Surv(GBSG2$time, GBSG2$cens)
+GBSG2$horTh_numeric <- ifelse(GBSG2$horTh == "yes", 1, 0)
+```
+
+# 1. GLM Tree
+
+```{r}
+## برازش مدل درخت GLM
+glm_tree <- glmtree(cens ~  horTh | age + menostat + tsize + tgrade
+                      + progrec + estrec + pnodes,
+                      data = GBSG2, family = binomial)
+
+print(glm_tree)
+print(glm_tree, node = 1) #Parameter instability tests , node = 1
+print(glm_tree, node = 2) #Parameter instability tests , node = 2
+print(glm_tree, node = 3) #Parameter instability tests , node = 3
+
+plot(glm_tree)
+plot(glm_tree, tp_args = list(cdplot = TRUE))
+plot(glm_tree, terminal_panel = NULL)
+
+## ضرایب رگرسیون
+coef(glm_tree)
+
+## معیارهای ارزیابی مدل
+deviance(glm_tree)
+logLik(glm_tree)
+AIC(glm_tree)
+BIC(glm_tree)
+
+print(summary(glm_tree))
+```
+
+# 1.1. GLM Tree Combined
+
+```{r}
+## برازش مدل ترکیبی
+glm_tree_combined <- glmtree(
+  cens ~  horTh + progrec | age + menostat + tsize + tgrade + 
+    pnodes + progrec + estrec + horTh,
+  data = GBSG2, 
+  family = binomial
+)
+
+print(glm_tree_combined)
+print(glm_tree_combined, node = 1) #Parameter instability tests , node = 1
+
+plot(glm_tree_combined, terminal_panel = NULL)
+
+## مقایسه مدل‌ها با معیار AIC
+cat("AIC Model 1 (Only horTh): ", AIC(glm_tree), "\n")
+cat("AIC Model 2 (horTh + progrec): ", AIC(glm_tree_combined), "\n")
+
+
+print(summary(glm_tree_combined))
+```
+
+# 2. PALM Tree
+
+```{r}
+palm_tree <- palmtree(
+  log(time) ~ horTh | age | pnodes + tgrade + progrec + estrec + tsize,
+  data = GBSG2
+)
+
+print(palm_tree)
+print(palm_tree, node = 1) #Parameter instability tests , node = 1
+
+print(coef(palm_tree))
+plot(palm_tree)
+
+print(summary(palm_tree$tree))
+print(summary(palm_tree$palm))
+
+
+```
+
+# 3. Survival GLM Tree
+
+```{r}
+GBSG2$y_surv <- Surv(GBSG2$time, GBSG2$cens)
+GBSG2$horTh_numeric <- ifelse(GBSG2$horTh == "yes", 1, 0) 
+
+#======================= 1 ====================
+#------------- GLM tree + Weibull -------------
+#==============================================
+glm_formula <- y_surv ~ horTh | age + tsize + tgrade + pnodes + progrec + estrec
+
+
+library(sandwich) # برای استخراج توابع امتیاز (Score functions) در درخت
+
+survival_fitter <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  # به جای ساختن یک لیست دستی، مستقیماً خود آبجکت مدل را برمی‌گردانیم.
+  # عبارت 0 + x باعث می‌شود mob خودش مدیریت ماتریس طراحی (Design Matrix) را انجام دهد.
+  model <- survreg(y ~ 0 + x, weights = weights, dist = "weibull")
+  return(model)
+}
+
+# ۲. اجرای مجدد مدل GLM Tree
+# (فرض بر این است که glm_formula و y_surv از قبل تعریف شده‌اند)
+surv_glmtree <- mob(glm_formula,data = GBSG2,fit = survival_fitter)
+
+print(surv_glmtree)
+plot(surv_glmtree)
+summary(surv_glmtree)
+
+#Instability tets Parameters
+print(surv_glmtree  , node = 1)
+
+
+#======================= 2 ====================
+#------------- GLM tree + PH COX -------------
+#==============================================
+glm_formula_cox <- y_surv ~ 0 + horTh | age + tsize + tgrade + horTh + progrec + estrec
+
+cox_fitter <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  # اختصاص وزن مساوی به داده‌ها در صورتی که وزنی تعیین نشده باشد
+  if (is.null(weights)) weights <- rep(1, NROW(y))
+  model <- coxph(y ~ x, weights = weights)
+  return(model)
+}
+
+surv_coxtree <- mob(glm_formula_cox, data = GBSG2, fit = cox_fitter)
+
+print(surv_coxtree)
+plot(surv_coxtree)
+
+summary(surv_coxtree)
+print(surv_coxtree  , node = 1)
+
+
+
+```
+
+# 4.1 Survival PALM Tree
+
+```{r}
+#=======================================
+#------------- PALM tree + Weibull(پیاده‌سازی الگوریتم Backfitting برای وایبول) -------
+#==========================================
+
+# تابع برازش وایبول با پشتیبانی از Offset
+weibull_fitter_offset <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  if (is.null(weights)) weights <- rep(1, NROW(y))
+  if (is.null(offset)) offset <- rep(0, NROW(y))
+  
+  # اعمال offset در مدل survreg
+  model <- survreg(y ~ 0 + x + offset(offset), weights = weights, dist = "weibull")
+  return(model)
+}
+
+# الگوریتم تکرارشونده PALM برای Weibull
+fit_weibull_palmtree <- function(data, max_iter = 15, tol = 1e-5) {
+  n <- nrow(data)
+  current_offset <- rep(0, n)
+  
+  # فرمول درخت: برخلاف کاکس، در وایبول به Intercept نیاز داریم تا هر گره مقیاس زمانی خودش را داشته باشد
+  tree_formula <- y_surv ~ horTh | pnodes + tsize + tgrade + progrec + estrec
+  
+  for (i in 1:max_iter) {
+    # الف) برازش درخت محلی با در نظر گرفتن اثر ثابت سراسری (Offset)
+    tree <- mob(tree_formula, 
+                data = data, 
+                fit = weibull_fitter_offset, 
+                offset = current_offset, 
+                control = mob_control(alpha = 0.05, minsize = 20)) 
+    
+    # استخراج شماره گره برای هر مشاهده
+    data$node <- as.factor(predict(tree, type = "node"))
+    
+    # ب) برازش مدل وایبول سراسری (Global Model)
+    # 0 + node: عرض از مبدأ جداگانه برای هر گره
+    # node:horTh_numeric: ضریب اثر محلی تیمار در هر گره
+    # age: اثر ثابت سراسری (Global Effect)
+    global_model <- survreg(y_surv ~ 0 + node + node:horTh_numeric + age, 
+                            data = data, dist = "weibull")
+    
+    # ج) استخراج ضریب سراسری age و به‌روزرسانی Offset
+    gamma_age <- coef(global_model)["age"]
+    new_offset <- data$age * gamma_age
+    
+    # بررسی شرط همگرایی
+    diff <- max(abs(new_offset - current_offset))
+    current_offset <- new_offset
+    
+    if (diff < tol) {
+      cat("✅ الگوریتم PALM Tree (Weibull) در تکرار", i, "با موفقیت همگرا شد.\n")
+      break
+    }
+  }
+  
+  return(list(tree = tree, global_model = global_model, gamma_age = gamma_age))
+}
+
+# اجرای الگوریتم روی داده‌ها
+weibull_palm_res <- fit_weibull_palmtree(GBSG2)
+
+print(weibull_palm_res$tree)
+plot(weibull_palm_res$tree, main = "PALM Tree - Weibull (Local Treatment Effect)")
+
+
+#(Significance)
+weibull_global_table <- summary(weibull_palm_res$global_model)
+print(weibull_global_table)
+
+
+#=======================================================================
+#  PALM tree + PH COX (همراه با الگوریتم و آزمون معناداری)
+#=======================================================================
+# الف) تابع برازش کاکس با پشتیبانی از Offset
+cox_fitter_offset <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  if (is.null(weights)) weights <- rep(1, NROW(y))
+  if (is.null(offset)) offset <- rep(0, NROW(y))
+  model <- coxph(y ~ x + offset(offset), weights = weights)
+  return(model)
+}
+
+# ب) تعریف و اجرای الگوریتم PALM برای Cox
+fit_cox_palmtree <- function(data, max_iter = 15, tol = 1e-5) {
+  n <- nrow(data)
+  current_offset <- rep(0, n)
+  tree_formula <- y_surv ~ 0 + horTh_numeric | pnodes + tsize + tgrade + progrec + estrec
+  
+  for (i in 1:max_iter) {
+    tree <- mob(tree_formula, data = data, fit = cox_fitter_offset, 
+                offset = current_offset, control = mob_control(alpha = 0.20, minsize = 30)) 
+    
+    data$node <- as.factor(predict(tree, type = "node"))
+    
+    # مدل کاکس سراسری با خطرات پایه متفاوت (strata) برای هر گره
+    global_model <- coxph(y_surv ~ strata(node) + 0 + node:horTh_numeric + age, data = data)
+    
+    gamma_age <- coef(global_model)["age"]
+    new_offset <- data$age * gamma_age
+    
+    if (max(abs(new_offset - current_offset)) < tol) {
+      cat("✅ الگوریتم PALM Tree (Cox PH) در تکرار", i, "همگرا شد.\n")
+      break
+    }
+    current_offset <- new_offset
+  }
+  return(list(tree = tree, global_model = global_model, gamma_age = gamma_age))
+}
+
+cox_palm_res <- fit_cox_palmtree(GBSG2)
+print(cox_palm_res$tree)
+plot(cox_palm_res$tree, main = "PALM Tree - Cox PH")
+
+# ج) بررسی معناداری ضرایب سراسری و محلی (Significance)
+cat("\n--- جدول معناداری پارامترهای مدل سراسری و محلی (PALM - Cox PH) ---\n")
+cox_global_table <- summary(cox_palm_res$global_model)$coefficients
+print(cox_global_table)
+
+cat("\n* تفکیک معناداری اثر محلی تیمار (horTh_num) در گره‌های مختلف درخت:\n")
+idx_treatment <- grep("horTh_num", rownames(cox_global_table))
+print(cox_global_table[idx_treatment, c("coef", "exp(coef)", "se(coef)", "Pr(>|z|)"), drop = FALSE])
+```
+
+# 4.2 Survival PLAM Tree_Algorithm
+
+```{r}
+
+# =======================================================
+#  تعریف متدهای S3 و توابع برازش بقا
+# ====================================================
+# Add: برای اینکه تابع mob در پکیج partykit بتواند مدل‌های بقا (survreg و coxph)
+# را درون گره‌های درخت برازش دهد، نیاز به تعریف توابع کمکی و متدهای استاندارد S3 داریم:
+logLik.surv_mob_model <- function(object, ...) {
+  structure(-object$objfun, df = length(object$coefficients), nobs = nrow(object$estfun), class = "logLik")
+}
+coef.surv_mob_model <- function(object, ...) { object$coefficients }
+estfun.surv_mob_model <- function(x, ...) { x$estfun }
+nobs.surv_mob_model <- function(object, ...) { nrow(object$estfun) }
+
+# Add: تابع برازش رگرسیون وایبل (Weibull) برای استفاده در mob
+survreg_weibull_fit <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  if (is.null(offset)) offset <- rep(0, nrow(x))
+  if (is.null(weights)) weights <- rep(1, nrow(x))
+  if (colnames(x)[1] == "(Intercept)") x <- x[, -1, drop = FALSE]
+  if (ncol(x) == 0) {
+    mod <- survreg(y ~ 1 + offset(offset), weights = weights, dist = "weibull")
+  } else {
+    mod <- survreg(y ~ x + offset(offset), weights = weights, dist = "weibull")
+  }
+  ef <- tryCatch(sandwich::estfun(mod), error = function(e) NULL)
+  if (is.null(ef)) ef <- matrix(0, nrow = nrow(x), ncol = length(coef(mod)))
+  rval <- list(coefficients = coef(mod), objfun = -as.numeric(logLik(mod)), estfun = ef, object = mod)
+  class(rval) <- "surv_mob_model"
+  return(rval)
+}
+
+# Add: تابع برازش رگرسیون کاکس (Cox Proportional Hazards) برای استفاده in mob
+coxph_fit <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...) {
+  if (is.null(offset)) offset <- rep(0, nrow(x))
+  if (is.null(weights)) weights <- rep(1, nrow(x))
+  if (colnames(x)[1] == "(Intercept)") x <- x[, -1, drop = FALSE]
+  if (ncol(x) == 0) {
+    mod <- coxph(y ~ 1 + offset(offset), weights = weights)
+  } else {
+    mod <- coxph(y ~ x + offset(offset), weights = weights)
+  }
+  ef <- tryCatch(sandwich::estfun(mod), error = function(e) NULL)
+  if (is.null(ef)) ef <- matrix(0, nrow = nrow(x), ncol = length(coef(mod)))
+  rval <- list(coefficients = coef(mod), objfun = -as.numeric(logLik(mod)), estfun = ef, object = mod)
+  class(rval) <- "surv_mob_model"
+  return(rval)
+}
+
+# ============================================================
+# ۳. تابع اصلی palmtree_AmirR
+# ============================================================
+palmtree_AmirR <- function (formula, data, weights = NULL, 
+                            # Add: آرگومان method برای تعیین هسته مدل‌سازی (خطی، وایبل یا کاکس)
+                            method = c("lm", "weibull", "cox"), 
+                            family = NULL, lmstart = NULL, 
+                            abstol = 0.001, maxit = 100, dfsplit = TRUE, verbose = FALSE, 
+                            plot = FALSE, ...) 
+{
+  cl <- match.call()
+  # Add: اعتبارسنجی آرگومان method و انتخاب تابع برازش مربوطه برای مدل‌های بقا
+  method <- match.arg(method)
+  
+  if (method %in% c("weibull", "cox")) {
+    fit_fun <- if (method == "weibull") survreg_weibull_fit else coxph_fit
+  }
+  # Replace: کنترل family صرفاً محدود به زمانی شد که متد از نوع خطی "lm" باشد
+  if (!is.null(family) && method == "lm") { 
+    if (!inherits(family, "family")) {
+      if (is.character(family)) family <- get(family)
+      if (is.function(family)) family <- family()
+    }
+  }
+  
+  ff <- Formula::as.Formula(formula)
+  tf <- formula(ff, lhs = 1L, rhs = c(1L, 3L))
+  rf <- formula(ff, lhs = 1L, rhs = 1L)
+  
+  # Replace: در مدل Cox به دلیل عدم وجود عرض از مبدأ (Intercept)، مقدار آن اجباراً FALSE می‌شود
+  intercept <- if (method == "cox") FALSE else (attr(terms(rf), "intercept") > 0L)
+  
+  # Replace: افزودن عرض از مبدأ (+1) به فرمول فقط برای متد خطی "lm" اعمال می‌شود
+  if (!intercept && method == "lm") 
+    rf <- update(rf, . ~ . + 1)
+  
+  rf0 <- formula(Formula::as.Formula(rf, formula(ff, lhs = 0L, rhs = 2L)), lhs = 1L, rhs = c(1L, 2L), collapse = TRUE)
+  
+  rf <- if (intercept) update(rf, . ~ .tree/.) else update(rf, . ~ .tree:.)
+  rf <- formula(Formula::as.Formula(rf, formula(ff, lhs = 0L, rhs = 2L)), lhs = 1L, rhs = c(1L, 2L), collapse = TRUE)
+  
+  data$.weights <- if (is.null(weights)) rep(1, nrow(data)) else weights
+  iteration <- 0L
+  
+  if (is.null(lmstart)) {
+    # Replace: تفکیک مقداردهی اولیه بر اساس هر ۳ روش
+    if (method == "lm") {
+      # روش اول: رگرسیون خطی یا تعمیم‌یافته استاندارد (کد اصلی)
+      lmstart_mod <- if (is.null(family)) lm(rf0, data = data, weights = .weights) else glm(rf0, data = data, weights = .weights, family = family)
+      lmstart <- predict(lmstart_mod)
+    } else if (method == "weibull") {
+      # Add: مقداردهی اولیه با پیش‌بینی‌های خطی (Linear Predictor) مدل وایبل
+      lmstart_mod <- survreg(rf0, data = data, weights = .weights, dist = "weibull")
+      lmstart <- predict(lmstart_mod, type = "linear")
+    } else if (method == "cox") {
+      # Add: مقداردهی اولیه با پیش‌بینی لگاریتم نسبت مخاطره (Linear Predictor / lp) در کاکس
+      lmstart_mod <- coxph(rf0, data = data, weights = .weights)
+      lmstart <- predict(lmstart_mod, type = "lp")
+    }
+  }
+  
+  data$.lm <- lmstart
+  continue <- TRUE
+  oldloglik <- -Inf
+  
+  while (continue) {
+    iteration <- iteration + 1L
+    
+    # Replace: اگر متد خطی بود از lmtree/glmtree (کد اول) استفاده می‌شود،
+    # در غیر این صورت (Add) از تابع mob با توابع بقا استفاده می‌کنیم.
+    if (method == "lm") {
+      tree <- if (is.null(family)) {
+        lmtree(tf, data = data, offset = .lm, weights = .weights, dfsplit = FALSE, ...)
+      } else {
+        glmtree(tf, data = data, offset = .lm, weights = .weights, dfsplit = FALSE, family = family, ...)
+      }
+    } else {
+      tree <- mob(tf, data = data, weights = .weights, offset = .lm, 
+                  fit = fit_fun, control = mob_control(dfsplit = FALSE, ...))
+    }
+    
+    if (plot) plot(tree)
+    
+    data$.tree <- factor(predict(tree, newdata = data, type = "node"))
+    
+    # Replace & Add: برازش مدل جامع (PALM) برای هر سه روش
+    if (length(levels(data$.tree)) > 1L) {
+      if (method == "lm") {
+        palm <- if (is.null(family)) lm(rf, data = data, weights = .weights) else glm(rf, data = data, weights = .weights, family = family)
+      } else if (method == "weibull") {
+        palm <- survreg(rf, data = data, weights = .weights, dist = "weibull")
+      } else if (method == "cox") {
+        palm <- coxph(rf, data = data, weights = .weights)
+      }
+    } else {
+      if (method == "lm") {
+        palm <- if (is.null(family)) lm(rf0, data = data, weights = .weights) else glm(rf0, data = data, weights = .weights, family = family)
+      } else if (method == "weibull") {
+        palm <- survreg(rf0, data = data, weights = .weights, dist = "weibull")
+      } else if (method == "cox") {
+        palm <- coxph(rf0, data = data, weights = .weights)
+      }
+    }
+    
+    # Delete: دستور b <- palm$coefficients حذف شد و با دستور استاندارد زیر جایگزین گردید:
+    b <- coef(palm)
+    coef_names <- names(b)
+    
+    if (length(levels(data$.tree)) > 1L) {
+      if (method == "lm") {
+        # روش اول (کد اصلی): استفاده از substr برای صفر کردن
+        palm$coefficients[substr(coef_names, 1L, 5L) %in% c(if (intercept) "(Inte" else NULL, ".tree")] <- 0
+      } else {
+        # Add: شناسایی هوشمندانه ضرایب برگ‌های درخت (.tree) و تقاطع‌ها با grepl برای بقا
+        is_local <- grepl("^\\.tree|\\(Intercept\\)", coef_names) | grepl(":.tree", coef_names)
+        b[is_local] <- 0
+      }
+    } else {
+      if (method == "lm") {
+        palm$coefficients[names(coef(tree))] <- 0
+      } else {
+        # Add: صفر کردن متغیرهای محلی در حالت تک‌برگ برای مدل‌های بقا
+        local_vars <- names(coef(tree))
+        local_vars <- local_vars[local_vars != "(Intercept)"]
+        b[coef_names %in% local_vars] <- 0
+      }
+    }
+    
+    # -----------------------------------------------------
+    # Replace & Fix: به‌روزرسانی آفست جهانی بدون Re-fit کردن مدل!
+    # -----------------------------------------------------
+    # در کد برای weibull و cox در انتهای این بخش، مدل مجدداً برازش (survreg/coxph) می‌شد.
+    # این کار باعث می‌شد تمام صفر کردن‌های بالا از بین برود! اکنون دقیقاً مشابه lm اصلاح شد:
+    if (method == "lm") {
+      data$.lm <- predict(palm, newdata = data)
+      palm$coefficients <- b
+    } else if (method == "weibull") {
+      palm$coefficients <- b # Replace: اعمال ضرایب صفر شده روی شیء مدل
+      data$.lm <- predict(palm, newdata = data, type = "linear") # Replace: پیش‌بینی آفست خالص جهانی
+      # Delete: دستور Re-fit کردن دوباره (palm <- survreg(...)) از اینجا حذف شد تا ضرایب صفر شده حفظ شوند!
+      palm <- survreg(if(length(levels(data$.tree)) > 1L) rf else rf0, data = data, weights = .weights, dist = "weibull")
+    } else if (method == "cox") {
+      palm$coefficients <- b  # Replace: اعمال ضرایب صفر شده روی شیء مدل
+      data$.lm <- predict(palm, newdata = data, type = "lp") # Replace: پیش‌بینی آفست خالص جهانی
+      palm <- coxph(if(length(levels(data$.tree)) > 1L) rf else rf0, data = data, weights = .weights)
+      # Delete: دستور Re-fit کردن دوباره (palm <- coxph(...)) از اینجا حذف شد!
+    }
+    
+    newloglik <- as.numeric(logLik(palm))
+    continue <- (newloglik - oldloglik > abstol) & (iteration < maxit)
+    oldloglik <- newloglik
+    
+    if (verbose) cat(paste0("Iteration: ", iteration, " | Log-Likelihood: ", round(oldloglik, 4), "\n"))
+  }
+  
+  # Replace: استخراج درجه آزادی به صورت استانداردتر attr(logLik(palm), "df") 
+  # و افزودن method به لیست نتایج خروجی
+  result <- list(formula = formula, call = cl, method = method, tree = tree, 
+                 palm = palm, data = data, nobs = nrow(data), loglik = newloglik, 
+                 df = attr(logLik(palm), "df"), dfsplit = dfsplit, iterations = iteration, 
+                 maxit = maxit, lmstart = lmstart, abstol = abstol, intercept = intercept, 
+                 family = family, mob.control = list(...))
+  class(result) <- "palmtree"
+  return(result)
+}
+
+# ==============================================================================
+# ۴. اجرای سه روش روی داده‌های GBSG2
+# ==============================================================================
+
+# تعریف فرمول برای بقا (Weibull و Cox):
+# Local: هورمون درمانی (horTh)
+# Global: سن (age) + اندازه تومور (tsize)
+# Partitioning: تعداد گره‌ها (pnodes) + گیرنده پروژسترون (progrec) + گیرنده استروژن (estrec)
+form_surv <- Surv(time, cens) ~ horTh | age + tsize | pnodes + progrec + estrec
+
+# تعریف فرمول برای مدل خطی (LM):
+# متغیر پاسخ به جای Surv لگاریتم زمان بقا log(time) است
+form_lm <- log(time) ~ horTh | age + tsize | pnodes + progrec + estrec
+
+# --- روش ۱: Weibull PALM Tree ---
+mod_weibull <- palmtree_AmirR(form_surv, data = GBSG2, method = "weibull", verbose = TRUE)
+print(summary(mod_weibull$palm)) # خلاصه مدل نهایی وایبل
+plot(mod_weibull$tree)           # رسم درخت نهایی
+
+# --- روش ۲: Cox PALM Tree ---
+mod_cox <- palmtree_AmirR(form_surv, data = GBSG2, method = "cox", verbose = TRUE)
+print(mod_cox)
+print(summary(mod_cox$palm))     # خلاصه مدل نهایی کاکس
+plot(mod_cox$tree)               # رسم درخت نهایی
+
+# --- روش ۳: Linear Model (LM) PALM Tree ---
+mod_lm <- palmtree_AmirR(form_lm, data = GBSG2, method = "lm", verbose = TRUE)
+print(summary(mod_lm$palm))      # خلاصه مدل نهایی رگرسیون خطی
+plot(mod_lm$tree)                # رسم درخت نهایی
+
+
+```
+
+# 5. Compare
+
+## 5.1 lm(palmtree vs Survival Palmtree_Algorithm)
+
+```{r}
+#Survival Palmtree_Algorithm
+mod_lm <- palmtree_AmirR(form_lm, data = GBSG2, method = "lm", verbose = TRUE)
+print(summary(mod_lm$palm))      # خلاصه مدل نهایی رگرسیون خطی
+plot(mod_lm$tree , main = "Lm-PALM ALgorithm") 
+
+#palmtree
+palm_tree <- palmtree(
+  log(time) ~ horTh | age | pnodes + tgrade + progrec + estrec + tsize,
+  data = GBSG2
+)
+
+print(palm_tree)
+plot(palm_tree , main= "lm-palmtree")
+
+print(summary(palm_tree$tree))
+print(summary(palm_tree$palm))
+
+# هر دو روش یکسان هستن . 
+```
+
+\
+
+## 5.2 Weibull(Survival Palmtree vs Survival Palmtree_Algorithm)
+
+```{r}
+#Survival Palmtree_Algorithm (1)
+mod_weibull <- palmtree_AmirR(form_surv, data = GBSG2, method = "weibull", verbose = TRUE)
+print(summary(mod_weibull$palm)) # خلاصه مدل نهایی وایبل
+plot(mod_weibull$tree)   
+
+#Survival Palmtree (2)
+weibull_palm_res <- fit_weibull_palmtree(GBSG2)
+
+print(weibull_palm_res$tree)
+plot(weibull_palm_res$tree, main = "PALM Tree - Weibull (Local Treatment Effect)")
+
+#در الگوریتم2 یک افراز بیشتر نسبت به الگوریتم 1 داریم . 
+# اگر متغیر estrec را از الگوریتم دوم حذف کنیم . نتایج یکسان میشه .
+
+```
+
+## 5.3 Cox(Survival Palmtree vs Survival Palmtree_Algorithm)
+
+```{r}
+#Survival Palmtree_Algorithm
+mod_cox <- palmtree_AmirR(form_surv, data = GBSG2, method = "cox", verbose = TRUE)
+print(mod_cox)
+print(summary(mod_cox$palm))     # خلاصه مدل نهایی کاکس
+plot(mod_cox$tree)               # رسم درخت نهایی
+
+#Survival Palmtree
+cox_palm_res <- fit_cox_palmtree(GBSG2)
+print(cox_palm_res$tree)
+plot(cox_palm_res$tree, main = "PALM Tree - Cox PH")
+
+#نتایج یکسان نیست . اما خیلی نزدیک بهم هستن . 
+```
+
+\
+
+## 
